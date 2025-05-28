@@ -1,7 +1,7 @@
 
 ;; stacking-app_contract
 ;; A decentralized stacking application that allows users to stack STX tokens,
-;; track rewards, and manage with advanced features.
+;; track rewards, and manage delegation with advanced features.
 
 ;; constants
 ;;
@@ -15,9 +15,13 @@
 (define-constant err-stacking-locked (err u106))
 (define-constant err-cooldown-period (err u107))
 (define-constant err-invalid-duration (err u108))
+(define-constant err-pool-full (err u109))
+(define-constant err-already-delegated (err u110))
 
 ;; Minimum amount required to stack
 (define-constant min-stacking-amount u100000000) ;; 100 STX
+;; Maximum number of stacking pools
+(define-constant max-pools u10)
 ;; Reward rate per cycle (in basis points, 100 = 1%)
 (define-constant reward-rate u500) ;; 5%
 ;; Cooldown period after unstacking (in blocks)
@@ -34,8 +38,29 @@
     lock-period: uint,
     unlock-height: uint,
     rewards-claimed: uint,
-    last-reward-cycle: uint
+    last-reward-cycle: uint,
+    delegated: bool,
+    delegated-to: (optional principal)
   }
+)
+
+;; Track stacking pools
+(define-map stacking-pools
+  { pool-id: uint }
+  {
+    operator: principal,
+    total-stacked: uint,
+    members-count: uint,
+    active: bool,
+    commission-rate: uint,
+    min-duration: uint
+  }
+)
+
+;; Track pool membership
+(define-map pool-members
+  { pool-id: uint, member: principal }
+  { amount: uint, joined-height: uint }
 )
 
 ;; Track user cooldown periods
@@ -49,6 +74,7 @@
 (define-data-var total-stackers uint u0)
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var current-cycle uint u0)
+(define-data-var next-pool-id uint u1)
 
 ;; private functions
 ;;
@@ -75,7 +101,9 @@
         lock-period: u0, 
         unlock-height: u0, 
         rewards-claimed: u0, 
-        last-reward-cycle: u0
+        last-reward-cycle: u0,
+        delegated: false,
+        delegated-to: none
       } 
       (map-get? stacker-info { stacker: stacker })))
     (new-amount (+ (get amount current-info) amount))
@@ -172,9 +200,75 @@
   )
 )
 
+;; Create a new stacking pool
+(define-public (create-pool (commission-rate uint) (min-duration uint))
+  (let (
+    (pool-id (var-get next-pool-id))
+    (operator tx-sender)
+  )
+    (asserts! (< pool-id max-pools) err-pool-full)
+    (asserts! (<= commission-rate u3000) err-unauthorized) ;; Max 30% commission
+    
+    (map-set stacking-pools
+      { pool-id: pool-id }
+      {
+        operator: operator,
+        total-stacked: u0,
+        members-count: u0,
+        active: true,
+        commission-rate: commission-rate,
+        min-duration: min-duration
+      }
+    )
+    
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+;; Join a stacking pool
+(define-public (join-pool (pool-id uint) (amount uint))
+  (let (
+    (stacker tx-sender)
+    (pool (unwrap! (map-get? stacking-pools { pool-id: pool-id }) err-not-found))
+  )
+    (asserts! (get active pool) err-unauthorized)
+    (asserts! (>= amount min-stacking-amount) err-minimum-not-met)
+    (asserts! (not (is-in-cooldown stacker)) err-cooldown-period)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount stacker (as-contract tx-sender)))
+    
+    ;; Update pool stats
+    (map-set stacking-pools
+      { pool-id: pool-id }
+      (merge pool {
+        total-stacked: (+ (get total-stacked pool) amount),
+        members-count: (+ (get members-count pool) u1)
+      })
+    )
+    
+    ;; Add member to pool
+    (map-set pool-members
+      { pool-id: pool-id, member: stacker }
+      { amount: amount, joined-height: block-height }
+    )
+    
+    ;; Update global stats
+    (var-set total-stacked (+ (var-get total-stacked) amount))
+    
+    (ok amount)
+  )
+)
+
 ;; Get stacker information
 (define-read-only (get-stacker-info (stacker principal))
   (map-get? stacker-info { stacker: stacker })
+)
+
+;; Get pool information
+(define-read-only (get-pool-info (pool-id uint))
+  (map-get? stacking-pools { pool-id: pool-id })
 )
 
 ;; Get global stacking stats
